@@ -9,7 +9,7 @@ echo "Are you sure you're sure?"
 read -n 1
 
 echo "Ok, destroy all the things in ${region}"
-cd $region
+cd infrastructure/$region
 terraform env select default
 terraform destroy -force -var-file=region.tfvars
 
