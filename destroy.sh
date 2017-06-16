@@ -13,3 +13,9 @@ cd infrastructure/$region
 terraform env select default
 terraform destroy -force -var-file=region.tfvars
 
+echo "Do you want to destroy the global resources?"
+read -n 1
+
+echo "Ok, destroying global resources..."
+cd infrastructure/global
+terraform destroy -force 
