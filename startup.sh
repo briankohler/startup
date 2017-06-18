@@ -349,5 +349,86 @@ terraform init
 terraform env new ops
 terraform env select ops
 terraform apply -var-file=region.tfvars -var create_base_image="true"
+cd ../../
+
+echo
+echo "VPCs created"
+echo
+echo "Now we create the application repo, which is nothing more than a repo of subrepos"
+echo "More than anything, the purpose of organizing like this gives some sense of what"
+echo "is out there."
+echo "Press any key to continue..."
+read -n 1
+echo
+curl -s -XPOST 'http://startup:startup@git:10080/api/v1/user/repos' -d '{ "name": "apps","private": true }' -H 'Content-Type: application/json'
+mkdir -p apps/${my_region} 
+cd apps
+git init
+git submodule add http://git:10080/applications/openvpn.git ${my_region}/openvpn
+
+cd ${my_region}
+cat > discovery.tf << END
+variable "bucket_prefix" {
+  default = "${bucket_prefix}"
+}
+variable "vpn_cidrs" {
+  type = "list"
+  default = []
+}
+variable "region" {
+  default = "${my_region}"
+}
+
+module "discovery" {
+  source = "git::http://git:10080/terraform_modules/discovery.git"
+  environment = "\${terraform.env}"
+  region = "\${var.region}"
+  bucket_prefix = "\${var.bucket_prefix}"
+  vpn_cidrs = "\${var.vpn_cidrs}"
+}
+END
+
+cat > state.tf.tmpl << END
+terraform {
+    required_version = "0.9.8"
+    backend "s3" {
+        bucket = "${state_bucket}"
+        encrypt = "true"
+        key = "apps/${my_region}-APPNAME"
+        region = "${statebucket_region}"
+    }
+}
+END
+
+cat state.tf.tmpl | sed 's/APPNAME/openvpn/g' > openvpn/state.tf
+git add --all
+git commit -m 'initial commit'
+git remote add origin http://git:10080/startup/apps.git
+git push -u origin master
+
+echo
+echo "App repo created and committed."
+echo "It contains 1 application, openvpn, which we will now apply and connect you to via Tunnelblick"
+echo "Press any key to continue..."
+read -n 1
+
+cd openvpn
+terraform init
+terraform env new ops
+terraform env select ops
+terraform apply -var use_extra_elb="true"
+terraform apply
+
+echo
+echo "Now creating Kubernetes cluster..."
+echo
+
+cd ../../
+git submodule add http://git:10080/applications/kubernetes_cluster.git ${my_region}/kubernetes_cluster
+cd ${my_region}
+cat state.tf.tmpl | sed 's/APPNAME/kubernetes_cluster/g' > kubernetes_cluster/state.tf
+git add --all
+git commit -m 'adding kubernetes_cluster'
+git push origin master
 
 
