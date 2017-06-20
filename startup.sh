@@ -431,4 +431,13 @@ git add --all
 git commit -m 'adding kubernetes_cluster'
 git push origin master
 
+cd kubernetes_cluster
+cp ~/.ssh/startmeup.key .
+./parallel_build.sh
+terraform init
+terraform env new ops
+terraform env select ops
+
+terraform apply -var parallel_build="true"
+
 
