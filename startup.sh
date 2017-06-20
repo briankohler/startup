@@ -1,5 +1,6 @@
 #!/bin/bash 
 
+TERRAFORM_VERSION=0.9.8
 docker -v 2>&1 > /dev/null
 ec=$?
 
@@ -79,12 +80,12 @@ fi
 
 echo "Checking Terraform..."
 
-TERRAFORM_VERSION=$(terraform -v | cut -d" " -f2)
+INSTALLED_TERRAFORM_VERSION=$(terraform -v | cut -d" " -f2)
 
-if [ $? -ne 0 ] || [ "${TERRAFORM_VERSION}" != "v0.9.8" ]
+if [ $? -ne 0 ] || [ "${INSTALLED_TERRAFORM_VERSION}" != "v${TERRAFORM_VERSION}" ]
 then
-  echo "Terraform either outdated or missing. Downloading Terraform 0.9.8"
-  curl -o terraform.zip 'https://releases.hashicorp.com/terraform/0.9.8/terraform_0.9.8_darwin_amd64.zip?_ga=2.22939835.1200042640.1496791588-1012937137.1462542546'
+  echo "Terraform either outdated or missing. Downloading Terraform ${TERRAFORM_VERSION}"
+  curl -o terraform.zip 'https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_darwin_amd64.zip?_ga=2.22939835.1200042640.1496791588-1012937137.1462542546'
   unzip terraform.zip
   chmod +x terraform
   /bin/mv terraform /usr/local/bin/
@@ -115,23 +116,30 @@ echo "offers.  After everything builds, you'll end up with these repos running i
 echo "GitHub or continue to use Gogs."
 git clone repos/ git
 cd git && docker-compose up -d && cd ..
-echo "Gogs is now running on your localhost.  You can login via a browser at http://git:10080 with username 'startup' and password 'startup'."
+while ! curl -s git:10080 2>&1 > /dev/null; do
+  echo "Waiting for Gogs to start..."
+  sleep 2
+done
+echo "Gogs is now running on your localhost.  The script will pause so you can review the repositories contained within.  You can login via a browser at http://git:10080 with username 'startup' and password 'startup'."
 echo "Press any key to continue"
 read -n 1
 
 echo "Now, just a couple of questions..."
 echo "What is your AWS Account ID?"
 read account_id
-echo "Choose a bucket prefix.  This string is prepended to bucket names to help ensure uniqueness. It can be left blank, but will likely lead to errors."
-echo "Suggestion: Choose a unique string, eg., bkstartmycloud"
+
+echo "Choose a bucket prefix.  This string is prepended to bucket names to help ensure uniqueness. It can be left blank, but will likely lead to errors due to the globally unique nature of S3 buckets."
+echo "Suggestion: Choose a unique string, eg., mytestcloud5293"
 read bucket_prefix
 
-echo "To build the initial base image, we restrict SSH to only be allowed from your public IP in the security group"
-echo "Also, your public IP becomes part of the public network ACL, therefore, only your IP is allowed to access port 22 on all public subnets"
-echo "For now, we'll just use your public IP, but the variable is an array, so several CIDRs can be listed."
+echo "Part of this build involves creating Packer-defined base images. They are instantiated in the public subnet, thus SSH is restricted to only be allowed from your public IP."
+echo "In addition, your public IP becomes also becomes part of the public network ACL, therefore, only your IP is allowed to access port 22 on all public subnets."
+echo "For now, only your public IP is included in the configuration. Your IP is stored in an array, so after the initial environment build, you can add more IPs to this list if necessary."
 echo "Finding your public IP..."
 public_ip=$(dig +short myip.opendns.com @resolver1.opendns.com.)
-echo "Adding ${public_ip}/32 to the ACL whitelist. More addresses can be added later."
+echo "Your public IP is ${public_ip}"
+echo "Adding ${public_ip}/32 to the ACL whitelist."
+echo
 
 mkdir -p infrastructure/{global,region}
 echo '.terraform' > infrastructure/.gitignore
@@ -156,8 +164,8 @@ then
   echo "Creating a state bucket"
   echo "This is the only manually provisioned, unmanaged resources in the entire stack."
   echo "This is INTENTIONAL due to the sensitive nature of the contents of state files."
-  echo "In practice, very few users should have access to ths bucket, and really, only Jenkins should have access"
-  echo 
+  echo "In practice, very few users should have access to ths bucket, and it is generally best practice to only allow Jenkins or an analogous CI tool to have access."
+  echo
   echo 'In which region should your state bucket reside?'
   read statebucket_region
   echo 'Provide a bucket name for your state bucket, eg. name-terrraform-tfstates.'
@@ -170,28 +178,54 @@ else
   exit 1
 fi
 
+echo "Do you have an existing DynamoDB tables in ${statebucket_region} to be used for Terraform state locking and consistency? (y or n)"
+read -n 1 answer 
+
+if [ "${answer}" == "y" ] || [ "${answer}" == "Y" ]
+then
+  echo "The table must have a primary key of LockID"
+  echo "DynamoDB table name?"
+  read dynamodb_table
+elif [ "${answer}" == "n" ] || "${answer}" == "N" ]
+then
+  echo "Creating a DynamoDB table named terraform-state-locking in ${statebucket_region} with primary key LockID."
+  aws dynamodb create-table --attribute-definitions AttributeName=LockID,AttributeType=S --key-schema AttributeName=LockID,KeyType=HASH --table-name terraform-state-locking --region ${statebucket_region} --provisioned-throughput ReadCapacityUnits=1,WriteCapacityUnits=1
+  dynamodb_table=terraform-state-locking
+else
+  echo "invalid response. bailing"
+  exit 1
+fi
+  
+echo
+echo "While many implementations of Terraform use the state file(s) to reference previously-created, dependent resources in downstream configurations, this build takes a different approach.  Instead of requiring access to potentially sensitive state files, the Terraform code that generates root/foundational resources itself creates a Terraform module aptly named discovery.  This discovery module includes all relavent and necessary resource ids, bucket names, etc. generated.  The discovery module is then included in downstream Terraform configurations and is used to reference dependent root resources without exposing any state files or the buckets that contain them."
+echo
+echo "Press any key to continue..."
+read -n 1
+
 cat > infrastructure/global/state.tf << END
 provider "aws" {
   region = "us-east-1"
 }
 terraform {
-    required_version = "0.9.8"
+    required_version = "${TERRAFORM_VERSION}"
     backend "s3" {
         bucket = "${state_bucket}"
         encrypt = "true"
         key = "terraform-remote-state-global"
         region = "${statebucket_region}"
+        dynamodb_table = "${dynamodb_table}"
     }
 }
 END
 
-echo 'Which region would you like to build in?  The region must have ECS available and have limits increased to allow 8 EIPs/NAT Gateways to provision (eg. us-west-2)'
+echo 'In which region would you like to build the VPC? Ensure that resource limits in this region are increased to allow 8 EIPs/NAT gateways to be provisioned'
 read my_region
 
-echo 'We will be deploying 4 VPCs across 2 AZs, named ops,qa,stg,prd.  These names are not configurable yet, but will be soon.'
-echo 'The 4 VPCs are organized in a hub-and-spoke model, with ops as the hub, and qa/stg/prd are the spokes.  Peering connections from ops to each of the other three allow traffic to from from environments to/from ops, but never to each other to preserve isolation'
-echo 'Ops is the common VPC with which the others peer.  Each VPC is a /18 subnet, carved out from a larger /16 subnet'
-echo 'Specify the first two octets of the /16 network that encompasses all 4 VPCs (eg. 10.201)'
+echo "4 VPCs will be provisioned in ${my_region}, each across 2 AZs, named ops,qa,stg,prd.  These names are not configurable yet, however, this feature will be available soon."
+echo 'The 4 VPCs are organized in a hub-and-spoke model, with ops as the hub, and qa/stg/prd as the spokes.  Peering connections from ops to each of the other three allow traffic and DNS resolution to/from qa,stg,prd and ops, but never between each other to preserve isolation.'
+echo 'Ops is the common VPC with which the others peer and is meant to house common/shared resources such as Jenkins/CI tools, log aggregation, metric collection tools, VPN access servers, and other analogous software.  Each VPC assumes a /18 subnet, carved out from a larger /16 subnet. Adding other subnet layout options is a feature that will be available soon, however, the ability to freely select any size subnet will not be possible, preferring instead to generate predictable, consistent networking patterns.'
+echo
+echo 'Specify the first two octets of the /16 network that will encompass the 4 VPCs (eg. 10.201)'
 read supernet
 
 cat > infrastructure/region/state.tf << END
@@ -200,12 +234,13 @@ provider "aws" {
 }
 
 terraform {
-    required_version = "0.9.8"
+    required_version = "${TERRAFORM_VERSION}"
     backend "s3" {
         bucket = "${state_bucket}"
         encrypt = "true"
         key = "terraform-remote-state-region-${my_region}"
         region = "${statebucket_region}"
+        dynamodb_table = "${dynamodb_table}"
     }
 }
 END
@@ -216,30 +251,35 @@ echo "num_azs = 2" >> infrastructure/region/region.tfvars
 
 /bin/mv infrastructure/region infrastructure/${my_region}
 
-echo "You, of course, need a private key.  For now, this will generate one that is used for all environments"
-echo "After bootstrap, you can easily vary the public key per environment"
-echo "However, it should be noted that, when Puppet/cfg mgmt is incorporated, it will assume the responsibility of managing user"
-echo "ssh keys on a per-node level and configured in hiera."
-echo "Generating ssh private and public keys for SSH access to nodes."
-echo "Your private Key is in ~/.ssh/startmeup.key. For all AMIs built by this process, use ec2-user as the SSH username"
+echo "Naturally, an SSH private key is needed to access nodes provisioned.  One will be generated that will be reused in all environments and labeled the {env}-default_key.  After bootstrap, any resources provisioned with this key can easily be changed, both on the nodes themselves and/or the Terraform configuration that generated the node."
+echo
+echo "Generating ssh private and public SSH keys."
+echo "Your private key is in ~/.ssh/startmeup.key and will be used to SSH to any nodes in this provisioning process."
+echo "Note that for all AMIs built by this process, use ec2-user as the SSH username."
 
 ssh-keygen -q -N "" -t rsa -f ~/.ssh/startmeup.key
 chmod 600 ~/.ssh/startmeup.key
 
 public_key=$(cat ~/.ssh/startmeup.key.pub)
 echo "default_public_key = \"${public_key}\"" >> infrastructure/${my_region}/region.tfvars
-
-echo "Injecting the public key into Gogs too"
+echo
+echo
+echo "Also, injecting the public SSH key into Gogs under the startup user for authenticated cloning via SSH."
 echo '{' > /tmp/key.json
 echo '"title":"startup@gogs",' >> /tmp/key.json
 echo "\"key\":\"$(cat ~/.ssh/startmeup.key.pub)\"" >> /tmp/key.json
 echo '}' >> /tmp/key.json 
 curl -s -XPOST "http://startup:startup@git:10080/api/v1/user/keys" -d @/tmp/key.json -H 'Content-Type: application/json'
-
+echo
+echo
+echo "For now, internal DNS domains are pre-configured to be in the form {environment}-{region_nodash}.aws, ie, ops-uswest2.aws.  This will be configurable in future revisions." 
 domain_suffix=$(echo $my_region | gsed 's/-//g').aws
-echo "SSL is not yet handled by this repo, but will be soon, and will be done using an on-demand SSL cert provisioning service,"
-echo "as this approach adheres best to best practices around handling sensitive information."
-echo "For now, we're just going to generate *.{private-dns-domain} self-signed certs and store them in a secrets subfolder"
+sleep 10
+echo
+echo "Future revisions of this automation will lay the foundation for using an on-demand SSL certififate provisioning service such as LetsEncrypt.  This approach adheres best to best practices around handling SSL certificates and keys."
+echo "As a default, self-signed wildcard SSL certificates/keys are generated, one per vpc, and stored in a separate secrets Git repo.  Future revisions will incorporate more sophisticated methods of handling secrets in general."
+echo
+sleep 10
 
 cd infrastructure/${my_region} && git clone http://git:10080/secrets/terraform_secrets.git secrets && cd ../../
 
@@ -251,6 +291,14 @@ done
 
 cd infrastructure/${my_region}/secrets && git add --all && git commit -m 'create self-signed certs' && git push origin master && cd ../../../
 rm -rf infrastructure/${my_region}/secrets
+
+echo "Self-signed SSL certs/keys generated..."
+sleep 5
+
+echo
+echo "Creating global and regional Terraform configurations.  The global configurations define resource that span all regions, which mostly constitutes common IAM roles and globally-scoped buckets.  Regional configurations include VPC resources, route53 zones, and regionally-scoped buckets.  These configurations will be committed to Gogs as the infrastructure repository."
+echo
+sleep 10
 
 cat > infrastructure/global/iam.tf << END
 variable "account_id" {}
@@ -314,10 +362,10 @@ cd infrastructure && git init && git submodule add http://git:10080/secrets/terr
     && git submodule update --remote --recursive && git add --all && git remote add origin http://git:10080/startup/infrastructure.git \
     && git commit -m 'initial commit' && git push -u origin master && cd ..
 
-echo 'Again, ensure you have the ability to create 8 EIPS/NAT gateways before proceeding.'
+echo 'Again, ensure you have the ability to create 8 EIPS/NAT gateways in ${my_region} before proceeding.'
 echo 'Requests for this usually fulfill in less than ten minutes.'
 echo 'To avoid any issues, verify your limits in the selected region via the AWS console,'
-echo 'and request an increase if necessary'
+echo 'and request an increase if necessary.'
 echo 'Press any key to start-up!'
 read -n 1
 
@@ -334,15 +382,16 @@ cd ../../
 echo
 echo 'IAM Roles created'
 echo
-echo 'Creating the VPCs and base AMI'
-echo 'This process is parallelized with Docker and uses Terraform environments'
-echo 'The ops VPC is created first and built using the Terraform binary installed on your laptop'
-echo 'Then, a script builds a container that is instantiated 3 times in parallel, each provisioning qa,stg,prd respectively'
-echo 'While qa,stg,prd VPCs are provisioning, Packer on your local system creates the base CentOS 7.3 AMI and base Ubuntu-14.04 AMI'
-echo 'on the ops public subnet.'
+sleep 5
+echo
+echo 'Creating the VPCs and base AMIs.'
+echo 'This process is parallelized with Docker and uses Terraform environments.'
+echo 'The ops VPC is created first and built using the Terraform binary installed on your laptop.'
+echo 'Then, a script builds a container image that is instantiated 3 times in parallel, each provisioning one of qa, stg, and prd, respectively.'
+echo 'While qa,stg,prd VPCs are provisioning, Packer on your local system creates the base CentOS 7.3 AMI and base Ubuntu-14.04 AMI on the ops public subnet.'
 echo 'The process takes between 10-12 minutes to complete.'
 echo
-sleep 3
+sleep 10
 
 cd infrastructure/${my_region}
 terraform init
@@ -352,14 +401,16 @@ terraform apply -var-file=region.tfvars -var create_base_image="true"
 cd ../../
 
 echo
-echo "VPCs created"
+echo "VPCs and base AMIs created"
 echo
-echo "Now we create the application repo, which is nothing more than a repo of subrepos"
-echo "More than anything, the purpose of organizing like this gives some sense of what"
-echo "is out there."
+echo "Now creating the apps repository, which is nothing more than a repo of subrepos."
+echo "The subrepos could be managed by various teams and could each have their own state bucket/files."
+echo "However, in order to maintain an authoratative list of resources provisioned, these subrepos should"
+echo "only be realized if included as submodules in the apps repo."
 echo "Press any key to continue..."
 read -n 1
 echo
+echo "Creating apps repository..."
 curl -s -XPOST 'http://startup:startup@git:10080/api/v1/user/repos' -d '{ "name": "apps","private": true }' -H 'Content-Type: application/json'
 mkdir -p apps/${my_region} 
 cd apps
@@ -390,15 +441,23 @@ END
 
 cat > state.tf.tmpl << END
 terraform {
-    required_version = "0.9.8"
+    required_version = "${TERRAFORM_VERSION}"
     backend "s3" {
         bucket = "${state_bucket}"
         encrypt = "true"
         key = "apps/${my_region}-APPNAME"
         region = "${statebucket_region}"
+        dynamodb_table = "${dynamodb_table}"
     }
 }
 END
+
+echo "The first application in the apps repo will be OpenVPN.  The following Terraform run will"
+echo "create an OpenVPN instance, load a configuration into your local instance of Tunnelblick, "
+echo "and connect to the VPN."
+echo "This is necessary because further node provisioning requires direct access to nodes in private"
+echo "subnets, and this implmentation favors authenticated VPN to cumbersome bastion servers."
+echo
 
 cat state.tf.tmpl | sed 's/APPNAME/openvpn/g' > openvpn/state.tf
 git add --all
@@ -408,7 +467,9 @@ git push -u origin master
 
 echo
 echo "App repo created and committed."
-echo "It contains 1 application, openvpn, which we will now apply and connect you to via Tunnelblick"
+echo "Applying Terraform configuration for OpenVPN"
+echo "You will be prompted for credentials when the VPN configuration is imported into Tunnelblick."
+echo "After import, connect to the startmeup connection in Tunnelblick to complete the Terraform run"
 echo "Press any key to continue..."
 read -n 1
 
@@ -420,7 +481,9 @@ terraform apply -var use_extra_elb="true"
 terraform apply
 
 echo
-echo "Now creating Kubernetes cluster..."
+echo "Now creating Kubernetes cluster module in the apps repo..."
+echo "A Kubernetes cluster will be instantiated in each of the environments."
+echo "Again, the build will be parallelized using Docker such that all 4 clusters will be built simultaneously."
 echo
 
 cd ../../
@@ -432,6 +495,44 @@ git commit -m 'adding kubernetes_cluster'
 git push origin master
 
 cd kubernetes_cluster
-cp ~/.ssh/startmeup.key ../
+cp ~/.ssh/startmeup.key ssh.key
 ./parallel_build.sh
+
+echo "Kubernetes clusters created"
+
+for i in ops qa stg prd
+do
+  echo "Opening Grafana and Kubernetes Dashboard for ${i} cluster..."
+  sleep 2
+  open https://admin:Welcome123@${i}-kubemastervip.${i}-${domain_suffix}:6443/api/v1/namespaces/kube-system/services/kubernetes-dashboard/proxy/
+  open http://grafana.k8s.${i}-${domain_suffix}
+done
+
+echo "The dashboards are are protected by basic auth, username admin, password Welcome123, which should be changed."
+echo
+echo "The clusters have 3 masters each, on which Etcd is also running.  Each cluster starts out with 1 minion NOT in an autoscaling group and 1 nginx-based ingress also NOT in an autoscaling group. The masters are not part of an autoscaling group."
+echo 
+echo "A wildcard DNS entry in each VPC *.k8s.{domain} points to the ingress node(s) and is intended to be the"
+echo "dedicated subdomain of Kubenetes applications exposed outside the clusters as ingresses."
+echo
+echo "Helm is also deployed in each cluster, in the event that a chart needs to be deployed."
+echo "Lastly, Heapster and InfluxDB are running on each cluster for collecting cluster metrics."
+echo "The inclusion of Heapster/InfluxDB is what exposes the graphs in the dashboard."
+echo "Grafana is also provisioned and is exposed as an ingress.  Grafana can be viewed at"
+echo "http://grafana.k8s.(ops|prd|qa|stg)-(region_nodash).aws"
+echo
+
+echo "Next steps"
+echo "Dynamic provisioning of EBS volumes to back InfluxDB"
+echo "The minions and ingresses are not currently in asgs.  Provisioning is easier to create dedicated, standalone nodes first, then install Kube autoscaling bits, scripts for new nodes to auto-join an existing cluster"
+echo "Provision EBS backed ES cluster that will collect logs inside and outside the pod, inside via fluentd and outside via logstash"
+echo "Fix InfluxDB Ingress and wire up carbon-relay-ng on all nodes to relay metrics to InfluxDB"
+echo "Adjust netdata to send metrics to InfluxDB ingress"
+echo "Transfer Gogs repos from provisioner laptop to s3, stop Gogs on the laptop, and launch Gogs in Kubernetes with EBS storage"
+echo "Stand up Jenkins master outside of Kubernetes (version of Docker in k8s is too old and lacks necessary features for Docker build process)"
+echo "Define jobs and job templates in Jenkins"
+echo "Launch a set of Demo services in QA, leaving it to the user to promote services to stg and prd"
+echo "Adjust base images to read tags via facter hooks.  Also, install Chef and Ansible clients on base images"
+echo "Adjust node default user data scripts to read provisioner tag, indicating which tool should be used to bootstrap node"
+
 

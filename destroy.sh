@@ -10,6 +10,7 @@ read -n 1
 
 echo "Ok, destroy all the things in ${region}"
 cd infrastructure/$region
+terraform init
 terraform env select default
 terraform destroy -force -var-file=region.tfvars
 
@@ -17,5 +18,6 @@ echo "Do you want to destroy the global resources?"
 read -n 1
 
 echo "Ok, destroying global resources..."
-cd infrastructure/global
+cd ../global
+terraform init
 terraform destroy -force 
