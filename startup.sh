@@ -87,7 +87,7 @@ then
   chmod +x packer 
   /bin/mv packer /usr/local/bin/
   rm packer.zip
-  echo "Packer ${PACKER_VERSION} installed"
+  echo "Packer 1.0.3 installed"
 fi
 
 echo "Checking Terraform..."
@@ -565,7 +565,24 @@ do
   terraform env new $i
   terraform env select $i
   terraform apply 
-fi
+done
+
+echo "Creating Jenkins master node"
+echo "It can be reached at ops-jenkins001:8080"
+
+cd ../../
+git submodule add http://git:10080/terraform_services/jenkins ${my_region}/jenkins
+cd ${my_region}
+cat state.tf.tmpl | sed 's/APPNAME/jenkins/g' > jenkins/state.tf
+git add --all
+git commit -m 'adding jenkins'
+git push origin master
+
+cd jenkins
+terraform init
+terraform env new ops
+terraform env select ops
+terraform apply
 
 echo "Next steps"
 echo "K8s-Dynamic provisioning of EBS volumes to back InfluxDB"
