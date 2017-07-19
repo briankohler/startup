@@ -1,6 +1,6 @@
-#!/bin/bash 
+#!/bin/bash  
 
-TERRAFORM_VERSION=0.9.8
+TERRAFORM_VERSION=0.9.11
 docker -v 2>&1 > /dev/null
 ec=$?
 
@@ -13,18 +13,19 @@ echo "you can expect the following:"
 echo "  - the script will prompt you for inputs specific to you, like AWS account id, desired subnets, etc."
 echo "  - in the region selected, 4 VPCs will be created, ops, qa, stg, and prd."
 echo "  - the 4 VPCs span a single /16 subnet, and each VPC is a /18 (1 quarter of the /16 supernet)"
-echo "  - each VPC is spread across 2 availability zones"
-echo "  - each VPC has 6 logical subnets, public, private, ephemeral, internal_vips, and data"
-echo "  - of these 6 logical subnets, internal_vips and data are optionally created, but default to create=true"
-echo "  - 2 AMIs are created, CentOS 7.3 and Ubuntu 14.04, each with enhanced networking and ENI enabled"
+echo "  - each VPC has its subnets spread across 2 availability zones"
+echo "  - each VPC has 5 logical subnets, public, private, ephemeral, internal_vips, and data"
+echo "  - of these 5 logical subnets, internal_vips and data are optionally created, but default to create=true"
+echo "  - 2 base AMIs are created, CentOS 7.3 and Ubuntu 14.04, each with enhanced networking and ENI enabled"
+echo "  - an OpenVPN node is created in ops that auto-connects your system to the private networks of the VPCs"
+echo "  - either/both a Kubernetes cluster and/or a Nomad/Consul are created in each of the 4 vpcs (you choose)"
+echo "  - a Jenkins master is created complete with template jobs to clone and re-use (only GoLang templates available)" 
+echo "  - an S3-backed private Docker registry that is available on all hosts on localhost (read only) and read-write on the Jenkins node"
+echo "  - examples of how both Puppet and Ansible could be used to provision systems"
 echo
 echo "There's more to come.  The end-state goal of this project includes the following:"
 echo "  - creation of a production-built ELK stack for log aggregation and visualization"
-echo "  - creation of a either (or both) a Kubernetes cluster and/or a Nomad cluster in each VPC"
-echo "  - creation of a Jenkins master with pre-populated template jobs intended to be cloned/re-used"
-echo "  - creation of an S3-backed private Docker repository for image storage and distribution"
 echo "  - creation of an InfluxDB cluster that collects node metrics, fronted by Grafana for visualization"
-echo "  - a Puppet-driven method for application deployment and configuration management"
 echo "  - a vault-driven method for secrets management that does not require integrating applications with vault directly"
 echo "  - this will all span more than 1 cloud provider"
 echo
@@ -63,14 +64,25 @@ else
   echo "Docker version ${VERSION} already installed"
 fi
 
+echo "Checking docker-compose..."
+VERSION=$(docker-compose -v)
+
+if [ $? -ne 0 ]
+then
+  echo "Missing Docker-compose.  Installing with Homebrew"
+  brew install docker-compose docker-compose-completion
+else
+  echo "Docker-compose version ${VERSION} already installed"
+fi
+
 echo "Checking Packer..."
 
 PACKER_VERSION=$(packer -v)
 
-if [ $? -ne 0 ] || [ "${PACKER_VERSION}" != "1.0.0" ]
+if [ $? -ne 0 ] || [ "${PACKER_VERSION}" != "1.0.3" ]
 then
-  echo "Packer either missing or outdated.  Downloading Packer 1.0.0"
-  curl -o packer.zip 'https://releases.hashicorp.com/packer/1.0.0/packer_1.0.0_darwin_amd64.zip?_ga=2.191845802.1256031939.1496791395-1073469743.1491481355'
+  echo "Packer either missing or outdated.  Downloading Packer 1.0.3"
+  curl -o packer.zip 'https://releases.hashicorp.com/packer/1.0.3/packer_1.0.3_darwin_amd64.zip?_ga=2.191845802.1256031939.1496791395-1073469743.1491481355'
   unzip packer.zip
   chmod +x packer 
   /bin/mv packer /usr/local/bin/
@@ -109,7 +121,7 @@ echo
 echo "We're going to create an instance of git locally that runs with Gogs as a frontend.  It's very similar to Github."
 echo "To make things easier, we're going to insert a host file record pointing 'git' to 'localhost'. You'll be prompted for credentials"
 echo
-sudo bash -c "echo '127.0.0.1  git' >> /etc/hosts"
+sudo bash -xc "echo '127.0.0.1  git' >> /etc/hosts"
 echo
 echo "The repos folder of this repository is a bare repository that includes dozens of repos.  This is the foundation of everything StartMeUp"
 echo "offers.  After everything builds, you'll end up with these repos running in a Gogs instance in your VPC.  You can easily mirror them to"
@@ -175,10 +187,13 @@ then
   aws s3api put-bucket-versioning --bucket $state_bucket --versioning-configuration Status=Enabled --region ${statebucket_region}
 else
   echo "invalid response. bailing"
+  rm -rf infrastructure
+  docker rm -f -v git_gogs_1
   exit 1
 fi
 
 echo "Do you have an existing DynamoDB tables in ${statebucket_region} to be used for Terraform state locking and consistency? (y or n)"
+echo "This is to ensure collaboration between team members do not conflict by ensuring changes occur one at a time"
 read -n 1 answer 
 
 if [ "${answer}" == "y" ] || [ "${answer}" == "Y" ]
@@ -193,6 +208,8 @@ then
   dynamodb_table=terraform-state-locking
 else
   echo "invalid response. bailing"
+  rm -rf infrastructure
+  docker rm -f -v git_gogs_1
   exit 1
 fi
   
@@ -255,7 +272,7 @@ echo "Naturally, an SSH private key is needed to access nodes provisioned.  One 
 echo
 echo "Generating ssh private and public SSH keys."
 echo "Your private key is in ~/.ssh/startmeup.key and will be used to SSH to any nodes in this provisioning process."
-echo "Note that for all AMIs built by this process, use ec2-user as the SSH username."
+echo "Note that for all AMIs built by this process, use ec2-user as the SSH username, regardless of distribution."
 
 ssh-keygen -q -N "" -t rsa -f ~/.ssh/startmeup.key
 chmod 600 ~/.ssh/startmeup.key
@@ -297,6 +314,7 @@ sleep 5
 
 echo
 echo "Creating global and regional Terraform configurations.  The global configurations define resource that span all regions, which mostly constitutes common IAM roles and globally-scoped buckets.  Regional configurations include VPC resources, route53 zones, and regionally-scoped buckets.  These configurations will be committed to Gogs as the infrastructure repository."
+echo "In some cases, a region must be specified for some global resources.  For these resources, us-east-1 is the reason chosen for reasons related to AWS infrastructure"
 echo
 sleep 10
 
@@ -359,7 +377,7 @@ curl -s -XPOST 'http://startup:startup@git:10080/api/v1/user/repos' -d '{ "name"
 
 cd infrastructure && git init && git submodule add http://git:10080/secrets/terraform_secrets ${my_region}/secrets \
     && git submodule add http://git:10080/terraform_modules/base_image ${my_region}/base_image && git submodule init \
-    && git submodule update --remote --recursive && git add --all && git remote add origin http://git:10080/startup/infrastructure.git \
+    && git submodule update --remote --recursive --init && git add --all && git remote add origin http://git:10080/startup/infrastructure.git \
     && git commit -m 'initial commit' && git push -u origin master && cd ..
 
 echo 'Again, ensure you have the ability to create 8 EIPS/NAT gateways in ${my_region} before proceeding.'
@@ -385,7 +403,7 @@ echo
 sleep 5
 echo
 echo 'Creating the VPCs and base AMIs.'
-echo 'This process is parallelized with Docker and uses Terraform environments.'
+echo 'This process is parallelized with Docker and uses Terraform environments, so there is going to be a lot of activity on the screen'
 echo 'The ops VPC is created first and built using the Terraform binary installed on your laptop.'
 echo 'Then, a script builds a container image that is instantiated 3 times in parallel, each provisioning one of qa, stg, and prd, respectively.'
 echo 'While qa,stg,prd VPCs are provisioning, Packer on your local system creates the base CentOS 7.3 AMI and base Ubuntu-14.04 AMI on the ops public subnet.'
@@ -406,7 +424,9 @@ echo
 echo "Now creating the apps repository, which is nothing more than a repo of subrepos."
 echo "The subrepos could be managed by various teams and could each have their own state bucket/files."
 echo "However, in order to maintain an authoratative list of resources provisioned, these subrepos should"
-echo "only be realized if included as submodules in the apps repo."
+echo "only be applied if included as submodules in the apps repo."
+echo "This allows users to provision systems how they choose, while allowing for an operational inventory of"
+echo "the software that is running and where it is running"
 echo "Press any key to continue..."
 read -n 1
 echo
@@ -481,58 +501,78 @@ terraform apply -var use_extra_elb="true"
 terraform apply
 
 echo
-echo "Now creating Kubernetes cluster module in the apps repo..."
-echo "A Kubernetes cluster will be instantiated in each of the environments."
-echo "Again, the build will be parallelized using Docker such that all 4 clusters will be built simultaneously."
+echo "Now creating Kubernetes cluster and Nomad modules in the apps repo..."
+echo "A Kubernetes cluster will be instantiated in each of the environments you choose"
+echo "Again, the build will be parallelized using Docker such that all (up to) 4 clusters will be built simultaneously."
 echo
+echo "Provide a space-delimited list of environments in which to provision a Kubernetes cluster.  Leave empty for none"
+read kube_envs
+echo "Provide a space-delimited list of environments in which to provision a Nomad/Consul cluster.  If empty, one will be created in ops"
+read nomad_envs
 
 cd ../../
 git submodule add http://git:10080/applications/kubernetes_cluster.git ${my_region}/kubernetes_cluster
+git submodule add http://git:10080/applications/nomad.git ${my_region}/nomad
 cd ${my_region}
 cat state.tf.tmpl | sed 's/APPNAME/kubernetes_cluster/g' > kubernetes_cluster/state.tf
+cat state.tf.tmpl | sed 's/APPNAME/nomad/g' > nomad/state.tf
 git add --all
-git commit -m 'adding kubernetes_cluster'
+git commit -m 'adding kubernetes_cluster and nomad'
 git push origin master
 
 cd kubernetes_cluster
 cp ~/.ssh/startmeup.key ssh.key
-./parallel_build.sh
+if [ "${kube_envs}" != "" ]
+then
+  echo "Creating Kubernetes clusters in ${kube_envs}"
+  ./parallel_build.sh "${kube_envs}"
+  for i in $kube_envs
+  do
+    echo "Opening Grafana and Kubernetes Dashboard for ${i} cluster..."
+    sleep 2
+    open https://admin:Welcome123@${i}-kubemastervip.${i}-${domain_suffix}:6443/api/v1/namespaces/kube-system/services/kubernetes-dashboard/proxy/
+    open http://grafana.k8s.${i}-${domain_suffix}
+  done
+  echo "The dashboards are are protected by basic auth, username admin, password Welcome123, which should be changed."
+  echo
+  echo "The clusters have 3 masters each, on which Etcd is also running.  Each cluster starts out with 1 minion NOT in an autoscaling group and 1 nginx-based ingress also NOT in an autoscaling group. The masters are not part of an autoscaling group."
+  echo
+  echo "A wildcard DNS entry in each VPC *.k8s.{domain} points to the ingress node(s) and is intended to be the"
+  echo "dedicated subdomain of Kubenetes applications exposed outside the clusters as ingresses."
+  echo
+  echo "Helm is also deployed in each cluster, in the event that a chart needs to be deployed."
+  echo "Lastly, Heapster and InfluxDB are running on each cluster for collecting cluster metrics."
+  echo "The inclusion of Heapster/InfluxDB is what exposes the graphs in the dashboard."
+  echo "Grafana is also provisioned and is exposed as an ingress.  Grafana can be viewed at"
+  echo "http://grafana.k8s.(ops|prd|qa|stg)-(region_nodash).aws"
+  echo
+else
+  echo "Skipping creation of Kubernetes clusters"
+fi
 
-echo "Kubernetes clusters created"
+if [ "${nomad_envs}" == "" ]
+then
+  nomad_envs=ops
+  echo "Defaulting to creating a Nomad/Consul cluster in ops"
+else
+  echo "Creating Nomad/Consul clusters in ${nomad_envs}"
+fi
 
-for i in ops qa stg prd
+cd ../nomad
+terraform init
+for i in $nomad_envs
 do
-  echo "Opening Grafana and Kubernetes Dashboard for ${i} cluster..."
-  sleep 2
-  open https://admin:Welcome123@${i}-kubemastervip.${i}-${domain_suffix}:6443/api/v1/namespaces/kube-system/services/kubernetes-dashboard/proxy/
-  open http://grafana.k8s.${i}-${domain_suffix}
-done
-
-echo "The dashboards are are protected by basic auth, username admin, password Welcome123, which should be changed."
-echo
-echo "The clusters have 3 masters each, on which Etcd is also running.  Each cluster starts out with 1 minion NOT in an autoscaling group and 1 nginx-based ingress also NOT in an autoscaling group. The masters are not part of an autoscaling group."
-echo 
-echo "A wildcard DNS entry in each VPC *.k8s.{domain} points to the ingress node(s) and is intended to be the"
-echo "dedicated subdomain of Kubenetes applications exposed outside the clusters as ingresses."
-echo
-echo "Helm is also deployed in each cluster, in the event that a chart needs to be deployed."
-echo "Lastly, Heapster and InfluxDB are running on each cluster for collecting cluster metrics."
-echo "The inclusion of Heapster/InfluxDB is what exposes the graphs in the dashboard."
-echo "Grafana is also provisioned and is exposed as an ingress.  Grafana can be viewed at"
-echo "http://grafana.k8s.(ops|prd|qa|stg)-(region_nodash).aws"
-echo
+  terraform env new $i
+  terraform env select $i
+  terraform apply 
+fi
 
 echo "Next steps"
-echo "Dynamic provisioning of EBS volumes to back InfluxDB"
-echo "The minions and ingresses are not currently in asgs.  Provisioning is easier to create dedicated, standalone nodes first, then install Kube autoscaling bits, scripts for new nodes to auto-join an existing cluster"
+echo "K8s-Dynamic provisioning of EBS volumes to back InfluxDB"
+echo "K8s-The minions and ingresses are not currently in asgs.  Provisioning is easier to create dedicated, standalone nodes first, then install Kube autoscaling bits, scripts for new nodes to auto-join an existing cluster"
 echo "Provision EBS backed ES cluster that will collect logs inside and outside the pod, inside via fluentd and outside via logstash"
 echo "Fix InfluxDB Ingress and wire up carbon-relay-ng on all nodes to relay metrics to InfluxDB"
 echo "Adjust netdata to send metrics to InfluxDB ingress"
 echo "Transfer Gogs repos from provisioner laptop to s3, stop Gogs on the laptop, and launch Gogs in Kubernetes with EBS storage"
-echo "Stand up Jenkins master outside of Kubernetes (version of Docker in k8s is too old and lacks necessary features for Docker build process)"
-echo "Define jobs and job templates in Jenkins"
-echo "Launch a set of Demo services in QA, leaving it to the user to promote services to stg and prd"
-echo "Adjust base images to read tags via facter hooks.  Also, install Chef and Ansible clients on base images"
-echo "Adjust node default user data scripts to read provisioner tag, indicating which tool should be used to bootstrap node"
 
 
