@@ -6,7 +6,7 @@ ec=$?
 
 echo "START-ME-UP"
 echo "The goal of this project is to provide a production-ready, cloud-based set of environments"
-echo "that, after bootstrapping, is ready to build an run applications.  The end-state goal is to"
+echo "that, after bootstrapping, is ready to build and run applications.  The end-state goal is to"
 echo "completely abstract the underlying operational concerns of developing software and running"
 echo "applications in a manner that adheres to industry best-practices.  After running this script,"
 echo "you can expect the following:"
